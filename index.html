@@ -9,190 +9,13 @@
 </head>
 <body>
   <div id="root"></div>
-
-  <!-- pdf.js (v3) -->
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
-  <!-- opencv.js (v4.10) -->
-  <script async src="https://cdn.jsdelivr.net/npm/opencv.js@4.10.0"
-          onload="onOpenCVReady()"></script>
-
   <script src="https://cdn.jsdelivr.net/npm/@stlite/mountable@0.63.1/build/stlite.js"></script>
   <script>
-    // ------------------------------------------------------------
-    // 1.  Wait for opencv.js to be ready
-    // ------------------------------------------------------------
-    let openCVReady = false;
-    let openCVResolve = null;
-    const cvReadyPromise = new Promise(resolve => { openCVResolve = resolve; });
-
-    function onOpenCVReady() {
-      cv.onRuntimeInitialized = () => {
-        openCVReady = true;
-        openCVResolve();
-      };
-    }
-    async function waitForOpenCV() {
-      await cvReadyPromise;
-      return true;
-    }
-    window.waitForOpenCV = waitForOpenCV;
-
-    // ------------------------------------------------------------
-    // 2.  pdf.js renderer → returns array of {width, height, data}
-    //     data is a Uint8Array of RGBA pixels (4 bytes per pixel)
-    // ------------------------------------------------------------
-    async function renderPDFPages(pdfBytes) {
-      // Set worker source (use the same version)
-      pdfjsLib.GlobalWorkerOptions.workerSrc =
-        'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
-
-      const loadingTask = pdfjsLib.getDocument({ data: pdfBytes });
-      const pdf = await loadingTask.promise;
-      const pages = [];
-
-      for (let i = 1; i <= pdf.numPages; i++) {
-        const page = await pdf.getPage(i);
-        const viewport = page.getViewport({ scale: 1.0 });   // 72 dpi; we'll scale to 300 dpi
-        const scale = 300 / 72;                               // desired DPI / base DPI
-        const scaledViewport = page.getViewport({ scale });
-
-        const canvas = document.createElement('canvas');
-        canvas.width = scaledViewport.width;
-        canvas.height = scaledViewport.height;
-        const context = canvas.getContext('2d');
-
-        await page.render({ canvasContext: context, viewport: scaledViewport }).promise;
-
-        const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
-        pages.push({
-          width: imageData.width,
-          height: imageData.height,
-          data: imageData.data   // Uint8ClampedArray of RGBA
-        });
-      }
-      return pages;
-    }
-    window.renderPDFPages = renderPDFPages;
-
-    // ------------------------------------------------------------
-    // 3.  opencv.js border detection + crop
-    //     Returns cropped RGBA image data + success flag
-    // ------------------------------------------------------------
-    async function detectAndCropJS(width, height, data, marginPercent) {
-      // Convert to cv.Mat (RGBA → RGBA)
-      let src = cv.matFromArray(height, width, cv.CV_8UC4, data);
-
-      // Convert to grayscale
-      let gray = new cv.Mat();
-      cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
-
-      // Edge detection
-      let blurred = new cv.Mat();
-      cv.GaussianBlur(gray, blurred, new cv.Size(5, 5), 0);
-      let edges = new cv.Mat();
-      cv.Canny(blurred, edges, 30, 100);
-
-      // Find contours
-      let contours = new cv.MatVector();
-      let hierarchy = new cv.Mat();
-      cv.findContours(edges, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
-
-      if (contours.size() == 0) {
-        // Cleanup and return original
-        src.delete(); gray.delete(); blurred.delete(); edges.delete();
-        contours.delete(); hierarchy.delete();
-        return { success: false, data: data, width: width, height: height };
-      }
-
-      // Find largest quadrilateral
-      let bestQuad = null;
-      let maxArea = 0;
-      const imgArea = width * height;
-
-      for (let i = 0; i < contours.size(); i++) {
-        let cnt = contours.get(i);
-        let area = cv.contourArea(cnt);
-        if (area < 0.3 * imgArea) continue;
-
-        let peri = cv.arcLength(cnt, true);
-        let approx = new cv.Mat();
-        cv.approxPolyDP(cnt, approx, 0.02 * peri, true);
-
-        if (approx.rows == 4 && area > maxArea) {
-          maxArea = area;
-          if (bestQuad) bestQuad.delete();
-          bestQuad = approx.clone();
-        }
-        approx.delete();
-      }
-
-      if (!bestQuad) {
-        // Cleanup and return original
-        src.delete(); gray.delete(); blurred.delete(); edges.delete();
-        contours.delete(); hierarchy.delete();
-        return { success: false, data: data, width: width, height: height };
-      }
-
-      // Order points
-      let pts = [];
-      for (let r = 0; r < 4; r++) {
-        pts.push({ x: bestQuad.data32F[r*2], y: bestQuad.data32F[r*2+1] });
-      }
-      // Simple ordering
-      pts.sort((a,b) => a.y - b.y || a.x - b.x);
-      let tl = pts[0], tr = pts[1], br = pts[3], bl = pts[2];
-      if (tl.x > tr.x) { let tmp = tl; tl = tr; tr = tmp; }
-      if (bl.x > br.x) { let tmp = bl; bl = br; br = tmp; }
-
-      const widthTop = Math.hypot(tr.x - tl.x, tr.y - tl.y);
-      const widthBot = Math.hypot(br.x - bl.x, br.y - bl.y);
-      const maxW = Math.max(widthTop, widthBot) | 0;
-      const heightLeft = Math.hypot(bl.x - tl.x, bl.y - tl.y);
-      const heightRight = Math.hypot(br.x - tr.x, br.y - tr.y);
-      const maxH = Math.max(heightLeft, heightRight) | 0;
-
-      // Perspective transform
-      let srcPts = cv.matFromArray(4, 2, cv.CV_32F, [tl.x, tl.y, tr.x, tr.y, br.x, br.y, bl.x, bl.y]);
-      let dstPts = cv.matFromArray(4, 2, cv.CV_32F, [0,0, maxW-1,0, maxW-1,maxH-1, 0,maxH-1]);
-      let transform = cv.getPerspectiveTransform(srcPts, dstPts);
-      let warped = new cv.Mat();
-      cv.warpPerspective(src, warped, transform, new cv.Size(maxW, maxH));
-
-      // Crop margin
-      const marginX = Math.min(Math.floor(maxW * marginPercent / 100), maxW >> 2);
-      const marginY = Math.min(Math.floor(maxH * marginPercent / 100), maxH >> 2);
-
-      let cropped = warped.roi(new cv.Rect(marginX, marginY, maxW - marginX*2, maxH - marginY*2));
-      // Convert cv.Mat back to Uint8Array (RGBA)
-      let croppedData = new Uint8Array(cropped.data.length);
-      croppedData.set(cropped.data);
-      let result = {
-        success: true,
-        width: cropped.cols,
-        height: cropped.rows,
-        data: croppedData
-      };
-
-      // Cleanup
-      src.delete(); gray.delete(); blurred.delete(); edges.delete();
-      contours.delete(); hierarchy.delete(); bestQuad.delete();
-      srcPts.delete(); dstPts.delete(); transform.delete(); warped.delete();
-      // cropped is a ROI view, don't delete it (it shares memory with warped), but warped will be deleted.
-
-      return result;
-    }
-    window.detectAndCropJS = detectAndCropJS;
-  </script>
-
-  <script>
-    // ------------------------------------------------------------
-    // 4.  Stlite mount
-    // ------------------------------------------------------------
     stlite.mount(
       {
         requirements: [
           "numpy",
-          "pillow"
+          "pillow"   // no pandas or openpyxl needed for the cropper
         ],
         entrypoint: "cropper_app.py",
         files: {
@@ -206,32 +29,23 @@ import zipfile
 
 st.set_page_config(page_title="PDF Auto Crop", layout="wide")
 st.title("📄 Auto Crop PDF Pages (remove thin border)")
-st.caption("Uses pdf.js + opencv.js for offline processing.")
+st.caption("Uses pdf.js + opencv.js, fully offline.")
 
-# ---------- ensure JS libraries are ready ----------
-def _init():
-    js.waitForOpenCV()   # opencv.js
-    st.write("OpenCV.js ready")
-
-_init()
-
-# ---------- helper: convert RGBA data URL to PIL ----------
+# ---------- Helpers to convert JS data to PIL ----------
 def rgba_to_pil(width, height, data_js):
     """Convert a JS Uint8Array (RGBA) to a PIL Image (RGB)."""
-    # data_js is a JS Uint8Array; convert to Python bytes
     buf = data_js.to_py()
-    # Convert RGBA → RGB
     img = Image.frombytes("RGBA", (width, height), buf).convert("RGB")
     return img
 
-# ---------- main UI ----------
+# ---------- UI ----------
 margin = st.slider("Crop margin (%)", 0.0, 10.0, 2.0, 0.5)
 pdf_file = st.file_uploader("Choose a PDF file", type="pdf")
 
 if pdf_file:
     pdf_bytes = pdf_file.read()
 
-    # Render pages with pdf.js → returns JS array of {width, height, data}
+    # Render pages with pdf.js (returns a JS array of {width, height, data})
     try:
         js_pages = js.renderPDFPages(pdf_bytes)
     except Exception as e:
@@ -240,11 +54,8 @@ if pdf_file:
 
     n_pages = len(js_pages)
     st.success(f"Loaded {n_pages} page(s).")
-    # Convert to PIL images (for preview and processing)
-    pil_pages = []
-    for i in range(n_pages):
-        page_obj = js_pages[i]
-        pil_pages.append(rgba_to_pil(page_obj.width, page_obj.height, page_obj.data))
+    # Convert to PIL images for preview
+    pil_pages = [rgba_to_pil(p.width, p.height, p.data) for p in js_pages]
 
     max_pages = st.number_input("Pages to process", 1, n_pages, n_pages)
     pil_pages = pil_pages[:max_pages]
@@ -254,11 +65,10 @@ if pdf_file:
     status = []
     for i, pil_img in enumerate(pil_pages):
         st.write(f"Processing page {i+1}...")
-        # Convert to RGBA bytes for opencv.js (we'll pass width, height, data)
+        # Convert PIL image to RGBA Uint8Array for opencv.js
         np_rgba = np.array(pil_img.convert("RGBA"))
-        # Flatten to list, make JS Uint8Array
         data_js = js.Uint8Array.new(np_rgba.flatten().tolist())
-        result = js.detectAndCropJS(pil_img.width, pil_img.height, data_js, margin)
+        result = js.detectAndCrop(pil_img.width, pil_img.height, data_js, margin)
         if result.success:
             cropped_pil = rgba_to_pil(result.width, result.height, result.data)
             cropped_pages.append(cropped_pil)
@@ -295,6 +105,142 @@ if pdf_file:
         st.download_button("Download cropped pages (PDF)", pdf_buf,
                            "cropped_pages.pdf", "application/pdf")
           `
+        },
+        pyodideReady: function (pyodide) {
+          // This runs inside the Web Worker – we can now load JS libraries
+          // directly into the worker’s global scope.
+
+          // 1. Load pdf.js (it will attach 'pdfjsLib' to self)
+          importScripts('https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js');
+          pdfjsLib.GlobalWorkerOptions.workerSrc =
+            'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+
+          // 2. Load opencv.js (it’s async, so we wrap it in a promise)
+          const loadOpenCV = new Promise((resolve) => {
+            importScripts('https://cdn.jsdelivr.net/npm/opencv.js@4.10.0');
+            cv['onRuntimeInitialized'] = () => {
+              resolve();
+            };
+          });
+
+          // 3. Define the helper functions (will be available to Python via js.)
+          //    PDF rendering helper
+          self.renderPDFPages = async function (pdfBytes) {
+            const loadingTask = pdfjsLib.getDocument({ data: pdfBytes });
+            const pdf = await loadingTask.promise;
+            const pages = [];
+
+            for (let i = 1; i <= pdf.numPages; i++) {
+              const page = await pdf.getPage(i);
+              const vp = page.getViewport({ scale: 300 / 72 }); // 300 DPI
+              const canvas = new OffscreenCanvas(vp.width, vp.height);
+              const ctx = canvas.getContext('2d');
+              await page.render({ canvasContext: ctx, viewport: vp }).promise;
+              const imgData = ctx.getImageData(0, 0, vp.width, vp.height);
+              pages.push({
+                width: imgData.width,
+                height: imgData.height,
+                data: imgData.data   // Uint8ClampedArray (RGBA)
+              });
+            }
+            return pages;
+          };
+
+          //    Border detection + crop helper
+          //    We'll wait for OpenCV to be ready before using it
+          self.detectAndCrop = async function (width, height, data, marginPercent) {
+            await loadOpenCV;  // ensures cv is ready
+            // data is a Uint8ClampedArray (RGBA)
+            let src = cv.matFromArray(height, width, cv.CV_8UC4, data);
+
+            // Grayscale + edge detection
+            let gray = new cv.Mat();
+            cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+            let blurred = new cv.Mat();
+            cv.GaussianBlur(gray, blurred, new cv.Size(5, 5), 0);
+            let edges = new cv.Mat();
+            cv.Canny(blurred, edges, 30, 100);
+
+            // Find contours
+            let contours = new cv.MatVector();
+            let hierarchy = new cv.Mat();
+            cv.findContours(edges, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+
+            let success = false;
+            let croppedData = data;  // fallback
+            let croppedW = width, croppedH = height;
+
+            if (contours.size() > 0) {
+              // Look for largest quadrilateral
+              let bestQuad = null, maxArea = 0;
+              const imgArea = width * height;
+              for (let i = 0; i < contours.size(); i++) {
+                let cnt = contours.get(i);
+                let area = cv.contourArea(cnt);
+                if (area < 0.3 * imgArea) continue;
+                let peri = cv.arcLength(cnt, true);
+                let approx = new cv.Mat();
+                cv.approxPolyDP(cnt, approx, 0.02 * peri, true);
+                if (approx.rows == 4 && area > maxArea) {
+                  maxArea = area;
+                  if (bestQuad) bestQuad.delete();
+                  bestQuad = approx.clone();
+                }
+                approx.delete();
+              }
+
+              if (bestQuad) {
+                // Order points (simple version)
+                let pts = [];
+                for (let r = 0; r < 4; r++) {
+                  pts.push({x: bestQuad.data32F[r*2], y: bestQuad.data32F[r*2+1]});
+                }
+                pts.sort((a,b) => a.y - b.y || a.x - b.x);
+                let tl = pts[0], tr = pts[1], br = pts[3], bl = pts[2];
+                if (tl.x > tr.x) [tl, tr] = [tr, tl];
+                if (bl.x > br.x) [bl, br] = [br, bl];
+
+                const maxW = Math.max(
+                  Math.hypot(tr.x - tl.x, tr.y - tl.y),
+                  Math.hypot(br.x - bl.x, br.y - bl.y)
+                ) | 0;
+                const maxH = Math.max(
+                  Math.hypot(bl.x - tl.x, bl.y - tl.y),
+                  Math.hypot(br.x - tr.x, br.y - tr.y)
+                ) | 0;
+
+                let srcPts = cv.matFromArray(4, 2, cv.CV_32F, [tl.x,tl.y, tr.x,tr.y, br.x,br.y, bl.x,bl.y]);
+                let dstPts = cv.matFromArray(4, 2, cv.CV_32F, [0,0, maxW-1,0, maxW-1,maxH-1, 0,maxH-1]);
+                let transform = cv.getPerspectiveTransform(srcPts, dstPts);
+                let warped = new cv.Mat();
+                cv.warpPerspective(src, warped, transform, new cv.Size(maxW, maxH));
+
+                const mX = Math.min(Math.floor(maxW * marginPercent / 100), maxW >> 2);
+                const mY = Math.min(Math.floor(maxH * marginPercent / 100), maxH >> 2);
+                let rect = new cv.Rect(mX, mY, maxW - mX*2, maxH - mY*2);
+                let cropped = warped.roi(rect).clone();  // clone so we can delete warped
+
+                croppedData = new Uint8Array(cropped.data);
+                croppedW = cropped.cols;
+                croppedH = cropped.rows;
+                success = true;
+
+                // cleanup
+                srcPts.delete(); dstPts.delete(); transform.delete(); warped.delete(); cropped.delete();
+                bestQuad.delete();
+              }
+            }
+            // cleanup
+            src.delete(); gray.delete(); blurred.delete(); edges.delete();
+            contours.delete(); hierarchy.delete();
+
+            return {
+              success: success,
+              width: croppedW,
+              height: croppedH,
+              data: croppedData
+            };
+          };
         }
       },
       document.getElementById("root")

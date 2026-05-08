@@ -113,11 +113,14 @@ self.addEventListener('fetch', event => {
         return Response.redirect(`${BASE}/?needkey=1`, 302);
       }
       try {
-        const htmlContent = await decrypt(encryptedBuffer, key);
+        //const htmlContent = await decrypt(encryptedBuffer, key);
         // Return as HTML with proper content type
-        return new Response(htmlContent, {
-          headers: { 'Content-Type': 'text/html' }
-        });
+        //return new Response(htmlContent, {
+         // headers: { 'Content-Type': 'text/html' }
+        const htmlContent = await decrypt(encryptedBuffer, key);
+        const fixedHtml = htmlContent.replace(/\.\.\/libs\//g, '/a4_50_bgd_omr/libs/');
+        return new Response(fixedHtml, { headers: { 'Content-Type': 'text/html' } });
+        //});
       } catch(e) {
         return new Response('Decryption failed', { status: 500 });
       }

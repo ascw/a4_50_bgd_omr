@@ -1,7 +1,7 @@
 {
   "name": "OMR Suite",
   "short_name": "OMR",
-  "start_url": ".https://ascw.github.io/a4_50_bgd_omr",
+  "start_url": ".",
   "display": "standalone",
   "theme_color": "#000000",
   "background_color": "#000000",
